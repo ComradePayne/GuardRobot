@@ -1,6 +1,8 @@
 class Entity:
 
+	#Enemy, Guard, or Waypoint
 	category = None
+	#World coordinates of entity
 	position = [0,0]
 
 

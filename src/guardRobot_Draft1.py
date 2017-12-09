@@ -3,6 +3,7 @@ import rospy
 import math
 import cv2
 import numpy
+import scipy.cluster.hierarchy as hcluster
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -35,8 +36,8 @@ global actualAngularVelocityZ
 global Max_angular_speed
 global Max_linear_speed
 
-Max_angular_speed = 0.5
-Max_linear_speed = 0.5
+Max_angular_speed = 0.1
+Max_linear_speed = 0.1
 
 linearKp = 0.3
 angKp = 0.5
@@ -69,7 +70,7 @@ measVarianceOdom = 0.1
 landmarks = [] #To be defined later.
 
 #Image Processing Fields:
-global intenseImage
+global blurryImage
 global bluenessImage
 global rednessImage
 global greennessImage
@@ -113,6 +114,9 @@ detectorParams.filterByCircularity = False
 detectorParams.filterByArea = True
 detectorParams.filterByColor = True
 
+detectorParams.minThreshold = 100
+detectorParams.maxThreshold = 256
+
 global blobFinder
 blobFinder = cv2.SimpleBlobDetector(detectorParams)
 
@@ -139,9 +143,11 @@ def IRCallback(depthImg):
 def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
 
     seenEntities = []
-    visionRange = 58
+    visionRange = 58.0
 
     degreesPerPixel = 1.0/11.0
+
+
     for blob in blob_keyPoints:
         blobX=blob.pt[0]
         blobY=blob.pt[1]
@@ -151,6 +157,8 @@ def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
 
         #rospy.loginfo("Depth Image X: {} \nDepth Image Y:{}\n".format(blobXPixel,blobYPixel))
         #rospy.loginfo(type(depthImage))
+
+
 
         #Data's in mm, so convert to meters.
         cv_image = bridge.imgmsg_to_cv2(depthImage, desired_encoding = "passthrough")
@@ -167,14 +175,45 @@ def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
         angleOfReading_deg = blobXPixel * degreesPerPixel
         angleOfReading_rad = numpy.pi/180.0 * angleOfReading_deg
 
-        worldAngle = currentPose[2] + ((numpy.pi/180.0) * visionRange) + angleOfReading_rad
-
-        rospy.loginfo("Angle of Reading: {}".format(worldAngle))
+        worldAngle = currentPose[2] + (((numpy.pi/180.0) * visionRange/2.0) - angleOfReading_rad)
+        #angleOfReading_deg = angleOfReading_deg + 61
+        #worldAngle = numpy.pi/180.0 * angleOfReading_deg
+        #rospy.loginfo("Angle of Reading: {}".format(worldAngle))
 
         positionOfObj = [currentPose[0] + math.cos(worldAngle) * depthMeasurement, currentPose[1] + math.sin(worldAngle) * depthMeasurement]
-
+        rospy.loginfo("Blob pose: {}".format(positionOfObj))
         seenEntities.append(Entity(category, positionOfObj))
     return seenEntities
+
+#Since the blob finder often finds multiple keypoints, it is necessary to cluster them together into sensibly averaged "actual positions"
+def clusterPositions(entityList):
+    positionList = []
+    for entity in entityList:
+        np_position = numpy.array(entity.position)
+        positionList.append(np_position)
+    rospy.loginfo(positionList)
+    clusterCenters = []
+    numberOfCenters = 0
+
+    if positionList:
+        threshold = 0.5
+        clusters = hcluster.fclusterdata(positionList, threshold, criterion="distance")
+
+        i=0
+        for clusterNum in clusters:
+            rospy.loginfo("Cluster I:{}".format(i) )
+            if i != 0 and clusters[i-1] != clusters[i]:
+                clusterCenters[clusterNum-2] = clusterCenters[clusterNum-2]/(i-1)
+                i=0
+            if len(clusterCenters) <= clusterNum:
+                clusterCenters.append([0.0,0.0])
+            rospy.loginfo("Cluster Num:{}\nCluster Index:{}".format(i, clusterNum))
+            clusterCenters[clusterNum-1] += positionList[i]
+            i = i+1
+        clusterCenters[clusterNum] = clusterCenters[clusterNum] / i
+        numberOfCenters = len(clusterCenters)
+    return clusterCenters, numberOfCenters
+
 
 
 #Given an entity with a position and a category, it first figures out if the entity is likely to be the same entity as an already existing entity.
@@ -190,7 +229,7 @@ def mapEntity(entity):
 
     elif entity.category == "Guard":
         matchesExisting = checkProbabilities(entity, guardList, probabilityThreshold)
-        rospy.loginfo("Matches existing: {}".format(matchesExisting))
+        #rospy.loginfo("Matches existing: {}".format(matchesExisting))
         if(not matchesExisting):
             guardList = []
             guardList.append(entity)
@@ -242,12 +281,13 @@ def imageCallback(img_rgb):
     theta = 1
     newImage_deShadowed = (maxIntensity/phi) * (cv_image/(maxIntensity/theta)) ** 0.5
     newImage_deShadowed = numpy.array(newImage_deShadowed, dtype='uint8')
-    
+    '''
+
 
 
     #Preprocessing done!
-    cv_image = newImage_deShadowed
-    '''
+    cv_image = cv2.GaussianBlur(cv_image, (5,5), 25)
+
 
     #Convert to an HSV image.
     img_hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
@@ -289,14 +329,19 @@ def imageCallback(img_rgb):
         for keypoint in blueKeypoints:
             pass
             #rospy.loginfo("blueKeypoint {}:{},{}".format(keypoint.pt[0], keypoint.pt[1],len(blueKeypoints)))
+            cv2.drawKeypoints(image=cv_bluenessImage, keypoints=blueKeypoints, outImage=cv_bluenessImage, color = [0,0,255])
     elif len(greenKeypoints) != 0:
         for keypoint in greenKeypoints:
             pass
             #rospy.loginfo("greenKeypoint {}:{},{}".format(keypoint.pt[0], keypoint.pt[1],len(greenKeypoints)))
+            cv2.drawKeypoints(image=cv_greennessImage, keypoints=greenKeypoints, outImage=cv_greennessImage, color = [0,255,0])
+
     elif len(redKeypoints) != 0:
-        for keypoint in greenKeypoints:
+        for keypoint in redKeypoints:
             pass
             #rospy.loginfo("redKeypoint {}:{},{}".format(keypoint.pt[0], keypoint.pt[1],len(redKeypoints)))
+            cv2.drawKeypoints(image=cv_rednessImage, keypoints=redKeypoints, outImage=cv_rednessImage, color = [255,0,0])
+
     else:
         rospy.loginfo("nothing detected")
         #rospy.loginfo("Size of Image {}:{}".format(keypoint, keypoint.size))
@@ -322,7 +367,9 @@ def odomCallback(data):
 
     theta = quatToEuler(data.pose.pose.orientation.w, data.pose.pose.orientation.z )
     myPose = [data.pose.pose.position.x, data.pose.pose.position.y, theta ]
+    #rospy.loginfo("Current Pose: {}".format(myPose))
 
+#Given orientation w and z (quaternion form), converts 
 def quatToEuler(orientationW, orientationZ):
     theta = math.atan2(2*orientationW * orientationZ, orientationW * orientationW - orientationZ*orientationZ)
 
@@ -375,9 +422,9 @@ def enemyBehavior(selfPose, enemyPose):
 
     vel.angular.z = angKp * theta_error
     if vel.angular.z > Max_angular_speed:
-        vel.angular.z = Max_angular_speed;
+        vel.angular.z = Max_angular_speed
     elif vel.angular.z < -Max_angular_speed:
-        vel.angular.z = -Max_angular_speed;
+        vel.angular.z = -Max_angular_speed
 
     vel.linear.x = linearKp * dist_robot_goal;
     if vel.linear.x > Max_linear_speed:
@@ -385,7 +432,7 @@ def enemyBehavior(selfPose, enemyPose):
     elif vel.linear.x < -Max_linear_speed:
         vel.linear.x = -Max_linear_speed 
 
-    if dist_robot_goal < 0.5:
+    if dist_robot_goal < 0.6:
         rospy.loginfo("Arrived!")
         vel.linear.x = 0
         vel.angular.z = 0
@@ -436,7 +483,7 @@ def main():
     blueImgPub = rospy.Publisher('/blueImage', Image, queue_size=10)
     redImgPub = rospy.Publisher('/redImage', Image, queue_size=10)
     greenImgPub = rospy.Publisher('/greenImage', Image, queue_size=10)
-    intensifiedImgPub = rospy.Publisher('/intenseImage', Image, queue_size=10)
+    #intensifiedImgPub = rospy.Publisher('/intenseImage', Image, queue_size=10)
 
     rospy.init_node('lab4', anonymous=True)
     rospy.Subscriber('/odom', Odometry, odomCallback)
@@ -450,12 +497,10 @@ def main():
             blueImgPub.publish(bluenessImage)
         if(rednessImage is not None):
             redImgPub.publish(rednessImage)
-
         if(greennessImage is not None):
             greenImgPub.publish(greennessImage)
-
-        if(intenseImage is not None):
-            intensifiedImgPub.publish(intenseImage)
+        #if(intenseImage is not None):
+        #    intensifiedImgPub.publish(intenseImage)
 
         #First, localize yer keypoints.
         if(depthImage is not None):
@@ -463,18 +508,22 @@ def main():
             seenReds = localizeKeypoints(redKeypoints, depthImage, "Enemy", myPose)
             seenGreens = localizeKeypoints(greenKeypoints, depthImage, "Waypoint", myPose)
 
+            estimatedReds, numReds = clusterPositions(seenReds)
+
+            rospy.loginfo("Cluster Positions Reds: {}".format(estimatedReds))
+
             closestEnemy = findClosestEntity(myPose, seenReds)
 
             if closestEnemy is not None:
                 vel = enemyBehavior(myPose, closestEnemy.position)
 
-                rospy.loginfo("My Pose: {}".format(myPose))
-                rospy.loginfo("Enemy Pose: {}".format(closestEnemy.position))
-                rospy.loginfo("Linear Vel: {}".format(actualVelocityX))
-                rospy.loginfo("Angular Vel: {}".format(actualAngularVelocityZ))
+                #rospy.loginfo("My Pose: {}".format(myPose))
+                #rospy.loginfo("Enemy Pose: {}".format(closestEnemy.position))
+                #rospy.loginfo("Linear Vel: {}".format(actualVelocityX))
+                #rospy.loginfo("Angular Vel: {}".format(actualAngularVelocityZ))
 
 
-                vel_pub.publish(vel)
+                #vel_pub.publish(vel)
 
 
 

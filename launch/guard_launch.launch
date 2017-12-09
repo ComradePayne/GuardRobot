@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+
+<launch>
+
+ <include file="$(find ~/../../opt/ros/indigo/share/turtlebot_bringup)/launch/minimal.launch">
+  </include>
+
+  <include file="$(find ~/../../opt/ros/indigo/share/turtlebot_navigation)/launch/gmapping.launch">
+  </include>
+
+  <include file="$(find ~/../../opt/ros/indigo/share/turtlebot_rviz_launchers)/launch/view_navigation.launch"></include>
+
+<!--uncomment if you need rviz visualization 
+ <node pkg="rviz" type="rviz" name="rviz" args="-d $(find crazyflie_demo)/launch/crazyflie.rviz" />-->
+ 
+ <!--
+ Add your nodes here, or launch minimal launch before running your own code
+ -->
+
+	<node pkg = "lab4" type="guardRobot_Draft1.py" name="guardRobot" />
+	
+</launch>

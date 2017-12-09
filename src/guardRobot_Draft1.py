@@ -4,6 +4,7 @@ import math
 import cv2
 import numpy
 import scipy.cluster.hierarchy as hcluster
+import time
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -82,7 +83,6 @@ global redKeypoints
 global greenKeypoints
 
 global currentEnemy
-global testEnemyList
 global guardList
 global waypointList
 
@@ -147,7 +147,9 @@ def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
 
     degreesPerPixel = 1.0/11.0
 
+    positions = []
 
+    avgPositionOfKeyPoints
     for blob in blob_keyPoints:
         blobX=blob.pt[0]
         blobY=blob.pt[1]
@@ -181,6 +183,8 @@ def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
         #rospy.loginfo("Angle of Reading: {}".format(worldAngle))
 
         positionOfObj = [currentPose[0] + math.cos(worldAngle) * depthMeasurement, currentPose[1] + math.sin(worldAngle) * depthMeasurement]
+        positions.append(positionOfObj)
+
         rospy.loginfo("Blob pose: {}".format(positionOfObj))
         seenEntities.append(Entity(category, positionOfObj))
     return seenEntities
@@ -191,27 +195,38 @@ def clusterPositions(entityList):
     for entity in entityList:
         np_position = numpy.array(entity.position)
         positionList.append(np_position)
+    positionList = numpy.array(positionList)
     rospy.loginfo(positionList)
-    clusterCenters = []
+    clusterCenters = numpy.empty(0)
     numberOfCenters = 0
 
-    if positionList:
-        threshold = 0.5
+
+
+    if len(positionList) > 1:
+        threshold = 0.7
         clusters = hcluster.fclusterdata(positionList, threshold, criterion="distance")
 
-        i=0
-        for clusterNum in clusters:
-            rospy.loginfo("Cluster I:{}".format(i) )
-            if i != 0 and clusters[i-1] != clusters[i]:
-                clusterCenters[clusterNum-2] = clusterCenters[clusterNum-2]/(i-1)
-                i=0
-            if len(clusterCenters) <= clusterNum:
-                clusterCenters.append([0.0,0.0])
-            rospy.loginfo("Cluster Num:{}\nCluster Index:{}".format(i, clusterNum))
-            clusterCenters[clusterNum-1] += positionList[i]
-            i = i+1
-        clusterCenters[clusterNum] = clusterCenters[clusterNum] / i
+        for i in range(len(positionList)):
+            clusterID = clusters[i]
+            positionsInCluster = positionList[clusterID == clusters]
+            rospy.loginfo("Cluster ID {}: {}".format(clusterID, positionsInCluster))
+
+            clusterCenters = numpy.append(clusterCenters, numpy.mean(positionsInCluster, axis=1), axis=0)
+        # clusterCenters.append([0.0,0.0])
+        
+        # for i in range (len(clusters)):
+        #     if i!=0 and clusters[i-1]!= clusters[i]:
+        #         clusterCenters[i] = numpy.mean(clusters[i])
+
+
+            
+
+        #clusterCenters[clusterNum] = numpy.mean(clusterCenters) 
+
         numberOfCenters = len(clusterCenters)
+        print 'ClusterCenters : {}'.format(clusterCenters)
+    elif len(positionList) ==1:
+        numpy.append(clusterCenters, positionList[0])
     return clusterCenters, numberOfCenters
 
 
@@ -258,6 +273,8 @@ def checkProbabilities(newEntity, entityList, pThreshold):
 
 #This function's responsible for supplying a collection of blobs that fit the given criteria - for now, just "blueness". 
 def imageCallback(img_rgb):
+    t1 = time.clock()
+
     global bridge
     global blobFinder
 
@@ -354,7 +371,8 @@ def imageCallback(img_rgb):
     bluenessImage = bridge.cv2_to_imgmsg(cv_bluenessImage, encoding="bgr8")
     rednessImage = bridge.cv2_to_imgmsg(cv_rednessImage, encoding="bgr8")
     greennessImage = bridge.cv2_to_imgmsg(cv_greennessImage, encoding="bgr8")
-
+    t2 = time.clock()
+    rospy.loginfo("Time taken in image processing:{}".format(t2-t1))
 
 
 #Stores odometry data into our global variables.
@@ -493,6 +511,7 @@ def main():
 
     while not rospy.is_shutdown():
         #Do something: Probably try to approach the nearest thing to guard. That can come later, I guess.
+        t1 = time.clock()
         if(bluenessImage is not None):
             blueImgPub.publish(bluenessImage)
         if(rednessImage is not None):
@@ -524,7 +543,8 @@ def main():
 
 
                 #vel_pub.publish(vel)
-
+        t2 = time.clock()
+        rospy.loginfo("time: {}".format(float(t1-t2)))
 
 
 

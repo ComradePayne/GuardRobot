@@ -5,6 +5,9 @@ import cv2
 import numpy
 import scipy.cluster.hierarchy as hcluster
 import time
+import pyaudio  
+import wave  
+
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -19,14 +22,15 @@ from Entity import Entity
 
 global angKp
 global linearKp
-global depthImage
-global goal_dist
-global goal_ang
-global follow_dist
+global angKd
+global linearKd
 
-global Kp
-global Ki
-global Kd
+global prevError_ang
+global prevError_linear
+
+global depthImage
+
+
 
 global myPose
 myPose = [0,0,0,0]
@@ -37,19 +41,20 @@ global actualAngularVelocityZ
 global Max_angular_speed
 global Max_linear_speed
 
-Max_angular_speed = 0.1
-Max_linear_speed = 0.1
+Max_angular_speed = 1.0
+Max_linear_speed = 0.5
 
 linearKp = 0.3
-angKp = 0.5
-depthImage = None
-goal_dist = 0
-goal_ang = 0
-follow_dist = 0.8
+linearKd = 0.1
 
-Kp = 0.2
-Ki = 0.01
-Kd = 0.01
+angKp = 0.5
+angKd = 0.2
+
+prevError_ang = 0.0
+prevError_linear = 0.0
+
+depthImage = None
+
 
 actualVelocityX = 0
 actualAngularVelocityZ = 0
@@ -91,7 +96,6 @@ global bridge
 bluenessImage = None
 rednessImage = None
 greennessImage = None
-intenseImage = None
 depthImage = None
 
 blueKeypoints = []
@@ -104,6 +108,7 @@ testEnemyList = []
 guardList = []
 waypointList = []
 
+#Initialize bridge object, for converting ROS images to openCV images and vice versa.
 bridge = CvBridge()
 
 global detectorParams 
@@ -130,26 +135,27 @@ def debugPrint(debugString):
         rospy.loginfo(debugString)
 
 
+#
 def IRCallback(depthImg):
-    #We'll have a collection of depth data at first. We can refine this to include color and such by processing
-    # multiple images - a depth image and a color image, for instance. 
     global depthImage
     depthImage = depthImg
     depthImageData = numpy.array(depthImage.data)
    # rospy.loginfo('printing the image type: {}'.format((depthImageData.data)))
     #print 'Shape of depthImage : {}'.format((depthImage.data))
-#Takes the image, rotates the robot until the blob's average location is near the center of the screen. (screenWidth / 2, rounded to nearest pixel, + margin)
-# Then, it uses the depth camera to figure out how far it is in front of the robot, then calculates the world coordinates of that spot.
+
+
+#Takes the blob keypoints, figures out the angles of the blobs from the robot.
+# Then, it uses the depth camera to figure out how far the blob is in front of the robot and its relative angle from the robot, then calculates the world coordinates of that spot from this information.
 def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
 
     seenEntities = []
-    visionRange = 58.0
+    fieldOfView = 58.0
 
     degreesPerPixel = 1.0/11.0
 
     positions = []
+    positionsAverage = 0.0
 
-    avgPositionOfKeyPoints
     for blob in blob_keyPoints:
         blobX=blob.pt[0]
         blobY=blob.pt[1]
@@ -171,99 +177,98 @@ def localizeKeypoints(blob_keyPoints, depthImage, category, currentPose):
 
 
         if(numpy.isnan(depthMeasurement) or depthMeasurement < 0.1):
-            rospy.loginfo("Measurement is not a number, or invalid.")
+            #rospy.loginfo("Measurement is not a number, or invalid.")
             return seenEntities
 
         angleOfReading_deg = blobXPixel * degreesPerPixel
         angleOfReading_rad = numpy.pi/180.0 * angleOfReading_deg
 
-        worldAngle = currentPose[2] + (((numpy.pi/180.0) * visionRange/2.0) - angleOfReading_rad)
+        #Here, we take advantage of the fact that we know the field of view of the Kinect Sensor: 58 degrees.
+        # We know that the angle of the reading will be at a certain theta for each group of 11 pixels in the image, from:
+        # image_width / degrees_FOV
+
+        worldAngle = currentPose[2] + (((numpy.pi/180.0) * fieldOfView/2.0) - angleOfReading_rad)
+
         #angleOfReading_deg = angleOfReading_deg + 61
         #worldAngle = numpy.pi/180.0 * angleOfReading_deg
         #rospy.loginfo("Angle of Reading: {}".format(worldAngle))
 
-        positionOfObj = [currentPose[0] + math.cos(worldAngle) * depthMeasurement, currentPose[1] + math.sin(worldAngle) * depthMeasurement]
+        positionOfObj = numpy.array([currentPose[0] + math.cos(worldAngle) * depthMeasurement, currentPose[1] + math.sin(worldAngle) * depthMeasurement])
         positions.append(positionOfObj)
+        #rospy.loginfo("Positions:{}".format(positions))
 
-        rospy.loginfo("Blob pose: {}".format(positionOfObj))
+        #rospy.loginfo("Blob pose: {}".format(positionOfObj))
         seenEntities.append(Entity(category, positionOfObj))
+
+    positions = numpy.asarray(positions)
+    if(numpy.any(positions)):
+        positionsAverage = [numpy.mean(positions[:,0]), numpy.mean(positions[:,1])]
+
+
     return seenEntities
 
-#Since the blob finder often finds multiple keypoints, it is necessary to cluster them together into sensibly averaged "actual positions"
-def clusterPositions(entityList):
+
+#The assumption is that the robot will only see one identifiable object at any given time. Otherwise, the average will probably be the midpoint between the two things.
+def averagePositions(entityList):
     positionList = []
     for entity in entityList:
-        np_position = numpy.array(entity.position)
-        positionList.append(np_position)
-    positionList = numpy.array(positionList)
-    rospy.loginfo(positionList)
-    clusterCenters = numpy.empty(0)
-    numberOfCenters = 0
+        positionList.append(entity.position)
 
+    if(positionList):
+        posXAvg = 0.0
+        posYAvg = 0.0
 
+        for position in positionList:
+            posXAvg += position[0]
+            posYAvg += position[1]
 
-    if len(positionList) > 1:
-        threshold = 0.7
-        clusters = hcluster.fclusterdata(positionList, threshold, criterion="distance")
+        posXAvg = posXAvg / len(positionList)
+        posYAvg = posYAvg / len(positionList)
 
-        for i in range(len(positionList)):
-            clusterID = clusters[i]
-            positionsInCluster = positionList[clusterID == clusters]
-            rospy.loginfo("Cluster ID {}: {}".format(clusterID, positionsInCluster))
-
-            clusterCenters = numpy.append(clusterCenters, numpy.mean(positionsInCluster, axis=1), axis=0)
-        # clusterCenters.append([0.0,0.0])
-        
-        # for i in range (len(clusters)):
-        #     if i!=0 and clusters[i-1]!= clusters[i]:
-        #         clusterCenters[i] = numpy.mean(clusters[i])
-
-
-            
-
-        #clusterCenters[clusterNum] = numpy.mean(clusterCenters) 
-
-        numberOfCenters = len(clusterCenters)
-        print 'ClusterCenters : {}'.format(clusterCenters)
-    elif len(positionList) ==1:
-        numpy.append(clusterCenters, positionList[0])
-    return clusterCenters, numberOfCenters
-
-
+        averagePosition = [posXAvg, posYAvg]
+        return [Entity(entityList[0].category, averagePosition)]
+    else:
+        return None
 
 #Given an entity with a position and a category, it first figures out if the entity is likely to be the same entity as an already existing entity.
 # The likilihood is inversely proportional to the distance between the new entity and an existing entity. 
+# Then, if the probability of matching an existing object falls below a certain threshold, the entity is mapped as a new entity. 
 def mapEntity(entity):
     global currentEnemy
     global guardList
     global waypointList
-    probabilityThreshold = 0.8
+    distThreshold = 0.8
 
     if entity.category == "Enemy":
         currentEnemy = entity
+        return True
 
     elif entity.category == "Guard":
-        matchesExisting = checkProbabilities(entity, guardList, probabilityThreshold)
+        matchesExisting = checkDistances(entity, guardList, distThreshold)
         #rospy.loginfo("Matches existing: {}".format(matchesExisting))
         if(not matchesExisting):
-            guardList = []
             guardList.append(entity)
+            return True
+        else:
+            return False
+
     else:
-        matchesExisting = checkProbabilities(entity, waypointList, probabilityThreshold)
+        matchesExisting = checkDistances(entity, waypointList, distThreshold)
         if(not matchesExisting):
-            waypointList = []
             waypointList.append(entity)
+            return True
+        else:
+            return False
 
 # True if a match, false if not.
-def checkProbabilities(newEntity, entityList, pThreshold):
-    probList = []
+def checkDistances(newEntity, entityList, dThreshold):
+    distList = []
     for entity in entityList:
-        probList.append(1/numpy.hypot(newEntity.position[0] - entity.position[0], newEntity.position[1] - entity.position[1]))
-    if (probList):
-        maxProb = max(probList)
-        minProb = min(probList)
+        distList.append(numpy.hypot(newEntity.position[0] - entity.position[0], newEntity.position[1] - entity.position[1]))
+    if (distList):
+        maxDist = max(distList)
 
-    if (not probList or maxProb > pThreshold):
+    if (not distList or maxDist > dThreshold):
         return False
 
     else:
@@ -273,7 +278,7 @@ def checkProbabilities(newEntity, entityList, pThreshold):
 
 #This function's responsible for supplying a collection of blobs that fit the given criteria - for now, just "blueness". 
 def imageCallback(img_rgb):
-    t1 = time.clock()
+    #t1 = time.clock()
 
     global bridge
     global blobFinder
@@ -289,18 +294,6 @@ def imageCallback(img_rgb):
 
     
     cv_image = bridge.imgmsg_to_cv2(img_rgb, desired_encoding = "bgr8")
-
-    #Some preprocessing of the image to make it easier on the blob finder.
-    '''
-    maxIntensity = 255.0
-    intensityRange = numpy.arange(maxIntensity)
-    phi = 1
-    theta = 1
-    newImage_deShadowed = (maxIntensity/phi) * (cv_image/(maxIntensity/theta)) ** 0.5
-    newImage_deShadowed = numpy.array(newImage_deShadowed, dtype='uint8')
-    '''
-
-
 
     #Preprocessing done!
     cv_image = cv2.GaussianBlur(cv_image, (5,5), 25)
@@ -323,7 +316,7 @@ def imageCallback(img_rgb):
     #rospy.loginfo ("minRedVals : {} maxRedVals :{}".format(minRedVals, maxRedVals))
     #These are the HSV ranges of the color Green. These will be the Waypoints: things to patrol between.
 
-    minGreenVals = numpy.array([33,80,40],dtype=numpy.uint8)
+    minGreenVals = numpy.array([33,150,40],dtype=numpy.uint8)
     maxGreenVals = numpy.array([100,255,255],dtype=numpy.uint8)
 
     bluMask = cv2.inRange(img_hsv, minBlueVals, maxBlueVals)
@@ -360,19 +353,15 @@ def imageCallback(img_rgb):
             cv2.drawKeypoints(image=cv_rednessImage, keypoints=redKeypoints, outImage=cv_rednessImage, color = [255,0,0])
 
     else:
-        rospy.loginfo("nothing detected")
+        pass
+        #rospy.loginfo("nothing detected")
         #rospy.loginfo("Size of Image {}:{}".format(keypoint, keypoint.size))
     
-    '''
-    bgrImageBlue = cv2.cvtColor(cv_bluenessImage, cv2.COLOR_HSV2BGR)
-    bgrImageRed = cv2.cvtColor(cv_rednessImage, cv2.COLOR_HSV2BGR)
-    bgrImageGreen = cv2.cvtColor(cv_greennessImage, cv2.COLOR_HSV2BGR)
-    '''
     bluenessImage = bridge.cv2_to_imgmsg(cv_bluenessImage, encoding="bgr8")
     rednessImage = bridge.cv2_to_imgmsg(cv_rednessImage, encoding="bgr8")
     greennessImage = bridge.cv2_to_imgmsg(cv_greennessImage, encoding="bgr8")
-    t2 = time.clock()
-    rospy.loginfo("Time taken in image processing:{}".format(t2-t1))
+    #t2 = time.clock()
+    #ospy.loginfo("Time taken in image processing:{}".format(t2-t1))
 
 
 #Stores odometry data into our global variables.
@@ -387,10 +376,9 @@ def odomCallback(data):
     myPose = [data.pose.pose.position.x, data.pose.pose.position.y, theta ]
     #rospy.loginfo("Current Pose: {}".format(myPose))
 
-#Given orientation w and z (quaternion form), converts 
+#Given orientation w and z (quaternion form), converts into euler value for yaw.
 def quatToEuler(orientationW, orientationZ):
     theta = math.atan2(2*orientationW * orientationZ, orientationW * orientationW - orientationZ*orientationZ)
-
     return theta
 
 #Stores the occupancy grid created by the SLAM algorithm (third-party, perhaps later our own).
@@ -399,94 +387,126 @@ def mapCallback(data):
     occGrid = data
 
 
-def PIDController(integral, prevError, measuredVal, refVal):
-    global Kp
-    global Ki
-    global Kd
-    error = refVal - measuredVal
-    integral += error
-    derivative = error - prevError
-    P = Kp * error
-    I = Ki * integral
-    D = Kd * derivative
-        
-    u = P + I + D
-        
-    prevError = error
 
-    return u;
+#Given a leg of the journey, return the goal point that should be attained.
+def explorationPlanner(leg, sizeOfSquare, startPose):
+    goalPose = []
+    if leg == 1:
+        goalPose = [startPose[0] + sizeOfSquare, startPose[1]]
+    elif leg == 2:
+        goalPose = [startPose[0] + sizeOfSquare, startPose[1] + sizeOfSquare]
+    elif leg == 3: 
+        goalPose = [startPose[0], startPose[1] + sizeOfSquare]
+    else:
+        goalPose = startPose
+    #rospy.loginfo("Goal Position:{}".format(goalPose))
+    return goalPose
 
-#SelfPose will have: [x,y, orientZ, orientW]
-#EnemyPose will have: [x,y]
-def enemyBehavior(selfPose, enemyPose):
-    global angKp
-    global linearKp
+#Given a set of waypoints and a round number, determine which waypoint to go to.
+def patrolPlanner(waypointList, currentWaypointIndex, round):
+    if(round >= 2):
+        return True
 
-    global Max_linear_speed
-    global Max_angular_speed
+    return waypointList[currentWaypointIndex].position
 
-    dist_robot_goal = math.sqrt((enemyPose[0]-selfPose[0])**2+(enemyPose[1]-selfPose[1])**2)
-    theta_desired = math.atan2(enemyPose[1]-selfPose[1], enemyPose[0]-selfPose[0])
-    theta = selfPose[2]
-    #theta = math.atan2(2*(orientation_x*orientation_y+orientation_w*orientation_z),orientation_w * orientation_w +orientation_x*orientation_x-orientation_y*orientation_y - orientation_z*orientation_z)
-    gamma = theta_desired - theta
 
-    theta_error = math.atan2(math.sin(gamma),math.cos(gamma))
-    rospy.loginfo("Theta Error: {}".format(theta_error))
+#Given a center of the circle, supplies a point on a circle depending on what fraction of the circumference has been attained.
+def guardPlanner(guardPose, circle_radius, indexCirclePoint):
 
-    vel=Twist()
-    vel.linear.x=0
-    vel.angular.z=0
+    cir_x_goals = numpy.array([x/50.0 for x in range(0,628,1)])
+    cir_y_goals = numpy.array([x/50.0 for x in range(0,628,1)])
 
-    vel.angular.z = angKp * theta_error
+    cir_goal_points_x = guardPose[0] + circle_radius * numpy.cos(cir_x_goals)
+    cir_goal_points_y = guardPose[1] + circle_radius * numpy.sin(cir_y_goals)
+
+    #If we've completed the trajectory, return True
+    if indexCirclePoint == len(cir_goal_points_x) - 1:
+        return True
+
+    return [cir_goal_points_x[indexCirclePoint] , cir_goal_points_y[indexCirclePoint]]
+
+
+
+def controller(goalPose, currentPose):
+    global prevError_linear, prevError_ang
+    global linearKp, linearKd
+    global angKp, angKd
+    global Max_linear_speed, Max_angular_speed
+
+    goal_point_x = goalPose[0]
+    goal_point_y = goalPose[1]
+
+    x_pose = currentPose[0]
+    y_pose = currentPose[1]
+
+    theta_desired = math.atan2(goal_point_y-y_pose, goal_point_x-x_pose)
+    theta = currentPose[2]
+    theta_error = theta_desired - theta
+    theta_error = math.atan2(math.sin(theta_error),math.cos(theta_error))
+
+    dist_robot_goal = math.sqrt((goal_point_x-x_pose)**2+(goal_point_y-y_pose)**2)
+
+
+    vel = Twist()
+    vel.angular.z = angKp * theta_error + angKd * (theta_error - prevError_ang)
+
+
+
+    if(dist_robot_goal < 0.1):
+        rospy.loginfo("Reached goal point!")
+        return True
+    rospy.loginfo("dist,theta,theta_desired,theta_error:%.2f,%.2f,%.2f,%.2f:",dist_robot_goal,theta,theta_desired,theta_error)
+    
+
+    #Cap velocity values.
     if vel.angular.z > Max_angular_speed:
-        vel.angular.z = Max_angular_speed
+        vel.angular.z = Max_angular_speed;
     elif vel.angular.z < -Max_angular_speed:
-        vel.angular.z = -Max_angular_speed
+        vel.angular.z = -Max_angular_speed;
+    if theta_error < 0.1:
+        vel.linear.x = linearKp * dist_robot_goal + linearKd * (dist_robot_goal - prevError_linear);
+        if vel.linear.x > Max_linear_speed:
+            vel.linear.x = Max_linear_speed
+        elif vel.linear.x < -Max_linear_speed:
+            vel.linear.x = -Max_linear_speed
 
-    vel.linear.x = linearKp * dist_robot_goal;
-    if vel.linear.x > Max_linear_speed:
-        vel.linear.x = Max_linear_speed
-    elif vel.linear.x < -Max_linear_speed:
-        vel.linear.x = -Max_linear_speed 
+    prevError_linear = dist_robot_goal
+    prevError_ang = theta_error
 
-    if dist_robot_goal < 0.6:
-        rospy.loginfo("Arrived!")
-        vel.linear.x = 0
-        vel.angular.z = 0
-
+    rospy.loginfo("Linear X Vel: {}\nAngular Z Vel:{}\n".format(vel.linear.x, vel.angular.z)) 
+    rospy.loginfo("Goal Position:{}".format(goalPose))
     return vel
 
-#Given a list of seen entities, find the closest one to oneself.
-def findClosestEntity(selfPose, entityList):
-    if(len(entityList) == 0):
-        rospy.loginfo("findClosestEntity: entityList is empty!\n")
-        return None
-
-    minDist = None
-    minDistEntity = None
-    for entity in entityList:
-        distance = numpy.hypot(selfPose[0] - entity.position[0], selfPose[1] - entity.position[1])
-        if(minDist is None or distance < minDist):
-            minDist = distance
-            minDistEntity = entity
-    return minDistEntity
-
+def playMusic(filename = "/home/robot6/catkin_ws/src/guard_robot/media/doggy.wav"):
+    #music(bark):
+    #define stream chunk   
+    chunk = 1024  
+    #open a wav format music  
+    f = wave.open("/home/robot6/catkin_ws/src/guard_robot/media/doggy.wav","rb")  
+    #instantiate PyAudio  
+    p = pyaudio.PyAudio()  
+    #open stream  
+    stream = p.open(format = p.get_format_from_width(f.getsampwidth()),channels = f.getnchannels(),rate = f.getframerate(),output = True)  
+    #read data  
+    data = f.readframes(chunk)  
+    #paly stream  
+    while data:  
+        stream.write(data)  
+        data = f.readframes(chunk) 
 
 
 def main():
     global angKp
     global linearKp
-
+    global Max_linear_speed
+    global Max_angular_speed
 
     global actualVelocityX
     global actualAngularVelocityZ
 
     global myPose
     global depthImage
-    global goal_dist
-    global goal_ang 
-    global follow_dist
+
 
     global bluenessImage
     global rednessImage
@@ -497,7 +517,13 @@ def main():
     global redKeypoints
     global greenKeypoints
 
+    global currentEnemy
+    global guardList
+    global waypointList
+
     vel_pub = rospy.Publisher('/cmd_vel_mux/input/navi', Twist, queue_size=10)
+
+
     blueImgPub = rospy.Publisher('/blueImage', Image, queue_size=10)
     redImgPub = rospy.Publisher('/redImage', Image, queue_size=10)
     greenImgPub = rospy.Publisher('/greenImage', Image, queue_size=10)
@@ -507,11 +533,36 @@ def main():
     rospy.Subscriber('/odom', Odometry, odomCallback)
     rospy.Subscriber('camera/rgb/image_raw', Image, imageCallback)
     rospy.Subscriber('/camera/depth/image_raw', Image, IRCallback)
+    rospy.Subscriber('/map', OccupancyGrid, mapCallback)
+
     rate = rospy.Rate(10)  # Main loop: 10Hz
 
+    #Phase 1: Exploration - In which we map out the guard and the waypoint positions, storing them in memory.
+    phase = 1
+
+    numGreensSeen = 0
+    maxGreens = 2
+    green_flag = 0
+
+    numBluesSeen = 0
+    maxBlues = 1
+    blue_flag = 0
+
+    legOfExplorationRoute = 1
+
+    explorationStartPose = [0,0,0]
+
+    #Phase 2: Patrol
+    currentWaypointIndex = 0
+    currentGuardIndex = 0
+    currentCircleIndex = 0
+
+    patrolRound = 0
+    guardMode = 0
+
+
+
     while not rospy.is_shutdown():
-        #Do something: Probably try to approach the nearest thing to guard. That can come later, I guess.
-        t1 = time.clock()
         if(bluenessImage is not None):
             blueImgPub.publish(bluenessImage)
         if(rednessImage is not None):
@@ -527,28 +578,113 @@ def main():
             seenReds = localizeKeypoints(redKeypoints, depthImage, "Enemy", myPose)
             seenGreens = localizeKeypoints(greenKeypoints, depthImage, "Waypoint", myPose)
 
-            estimatedReds, numReds = clusterPositions(seenReds)
+            #Assume that we only see one thing at a time.
+            estimatedBlue = averagePositions(seenBlues)
+            estimatedRed = averagePositions(seenReds)
+            estimatedGreen = averagePositions(seenGreens)
 
-            rospy.loginfo("Cluster Positions Reds: {}".format(estimatedReds))
-
-            closestEnemy = findClosestEntity(myPose, seenReds)
-
-            if closestEnemy is not None:
-                vel = enemyBehavior(myPose, closestEnemy.position)
-
-                #rospy.loginfo("My Pose: {}".format(myPose))
-                #rospy.loginfo("Enemy Pose: {}".format(closestEnemy.position))
-                #rospy.loginfo("Linear Vel: {}".format(actualVelocityX))
-                #rospy.loginfo("Angular Vel: {}".format(actualAngularVelocityZ))
-
-
-                #vel_pub.publish(vel)
-        t2 = time.clock()
-        rospy.loginfo("time: {}".format(float(t1-t2)))
+            if(estimatedBlue is not None):
+                pass
+                rospy.loginfo("Average Positions Blue: {}".format(estimatedBlue[0].position))
+            if(estimatedRed is not None):
+                pass
+                rospy.loginfo("Average Positions Red: {}".format(estimatedRed[0].position))
+            if(estimatedGreen is not None):
+                pass
+                rospy.loginfo("Average Positions Green: {}".format(estimatedGreen[0].position))
 
 
+            #The first phase, exploration.
+            if(phase == 1):
+                #Mapping Section: Chart the things we've seen in our movements.
+                if(numGreensSeen < maxGreens and estimatedGreen is not None):
+                    successfulMap = mapEntity(estimatedGreen[0])
+                    if(successfulMap):
+                        numGreensSeen +=1
+                if(numBluesSeen < maxBlues and estimatedBlue is not None):
+                    successfulMap = mapEntity(estimatedBlue[0])
+                    if(successfulMap):
+                        numBluesSeen +=1
 
-        '''for blueObj in seenBlues:
+                #Velocity/Trajectory Section: Create a velocity command, given a goal position. 
+
+                rospy.loginfo("Position:{}".format(myPose))
+
+                currentExplorationGoal = explorationPlanner(legOfExplorationRoute, 1, explorationStartPose)
+                rospy.loginfo("Type of cur:{}".format(currentExplorationGoal))
+                vel_cmd = controller(currentExplorationGoal, myPose)
+
+                if(vel_cmd == True):
+                    rospy.loginfo("Going to next leg: {}".format(legOfExplorationRoute + 1))
+                    legOfExplorationRoute += 1
+                else:
+                    rospy.loginfo("Haven't reached goal yet.")
+                    vel_pub.publish(vel_cmd)
+            '''
+            for guard in guardList:
+                rospy.loginfo("Guard Mapped Position: {}".format(guard.position))
+            for waypoint in waypointList:
+                rospy.loginfo("Waypoint Mapped Position: {}".format(waypoint.position))            
+            '''
+            if (numGreensSeen == maxGreens) and (numBluesSeen == maxBlues):
+                phase = 2
+                rospy.loginfo("Got blue and green points!")
+
+            if(guardList):
+                rospy.loginfo("Guard Points:{}".format(guardList))
+            if(waypointList):
+                rospy.loginfo("Waypoints: {}".format(waypointList))
+                
+            if phase == 2:
+
+                if estimatedRed:
+                    playMusic() 
+                    mapEntity(estimatedRed[0])
+                    vel_cmd = controller(currentEnemy.position,myPose)
+                    vel_pub.publish(vel_cmd)
+                    rospy.loginfo("***BARK BARK BARK****")
+
+                else:
+                    if guardMode == 0:
+                        goalPoint = patrolPlanner(waypointList, currentWaypointIndex, patrolRound)
+                        #Check if trajectory finished
+                        if(goalPoint == True):
+                            rospy.loginfo("*************Patrol finished!***************")
+                            guardMode = 1
+                        
+                        else:
+                            vel_cmd = controller(goalPoint, myPose)
+                            #Check if goal within trajectory reached.
+                            if(vel_cmd == True):
+                                rospy.loginfo("Waypoint {} reached".format(currentWaypointIndex))
+                                currentWaypointIndex = (currentWaypointIndex + 1) % 2
+                                patrolRound += 1
+                            else:
+                                rospy.loginfo("Following waypoint trajectory.")
+                                vel_pub.publish(vel_cmd)
+                    else:
+                        goalPoint = guardPlanner(guardList[currentGuardIndex].position, 2, currentCircleIndex)
+                        #Check if trajectory finished
+                        if(goalPoint == True):
+                            rospy.loginfo("*********Guard circling finished!*************")
+                            guardMode = 0
+
+                        else:
+                            vel_cmd = controller(goalPoint, myPose)
+                            #Check if goal within trajectory reached.
+                            if(vel_cmd == True):
+                                currentCircleIndex += 1
+                            else:
+                                rospy.loginfo("Following guard trajectory.")
+                                vel_pub.publish(vel_cmd)
+
+
+
+
+                
+
+
+            '''for blueObj in seenBlues:
             rospy.loginfo("{} Spotted! \n Pos X: {} \n Pos Y: {}\n".format(blueObj.category, blueObj.position[0], blueObj.position[1]))
             #mapEntity(blueObj)
 
@@ -562,7 +698,7 @@ def main():
         '''
         rate.sleep()
 
-    vel_pub.publish(Twist())
+    #vel_pub.publish(Twist())
       
 if __name__ == "__main__":
     main()    
